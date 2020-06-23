@@ -26,7 +26,6 @@ struct uharddoom_map {
 	struct uharddoom_buffer* buffer;
 	struct list_head lh;
 	struct file* file;
-
 };
 
 struct uharddoom_page {
@@ -37,7 +36,7 @@ struct uharddoom_page {
 struct uharddoom_buffer {
 	struct uharddoom_page *pages;
 	struct uharddoom_device *device;
-	uint32_t pages_nr;	
+	uint32_t pages_nr;
 };
 
 struct uharddoom_job {
@@ -81,7 +80,6 @@ static struct class uharddoom_class = {
 	.owner = THIS_MODULE,
 };
 
-
 /* Hardware handling. */
 
 static inline void uharddoom_iow(struct uharddoom_device *dev, uint32_t reg, uint32_t val)
@@ -118,22 +116,19 @@ static irqreturn_t uharddoom_isr(int irq, void *opaque)
 		if (istatus != UHARDDOOM_INTR_JOB_DONE) {
 			job->ctx->error = true;
 			uharddoom_iow(dev, UHARDDOOM_ENABLE, 0);
-			
 			uharddoom_iow(dev, UHARDDOOM_RESET, 0x7f7ffffe);
 			uharddoom_iow(dev, UHARDDOOM_INTR, 0xff33);
-
-			uharddoom_iow(dev, UHARDDOOM_ENABLE, UHARDDOOM_ENABLE_ALL & ~UHARDDOOM_ENABLE_BATCH);	
+			uharddoom_iow(dev, UHARDDOOM_ENABLE, UHARDDOOM_ENABLE_ALL & ~UHARDDOOM_ENABLE_BATCH);
 		}
-		job->ctx = 0; // ?
+		job->ctx = 0; 
 		list_add(&job->lh, &dev->jobs_free);
 		wake_up(&dev->free_wq);
 		if (list_empty(&dev->jobs_running)) {
-			/* No more jobs to run.  */
+			/* No more jobs to run. */
 			wake_up(&dev->idle_wq);
 		} else {
 			/* Run the next job. */
 			job = list_entry(dev->jobs_running.next, struct uharddoom_job, lh);
-		
 			uharddoom_iow(dev, UHARDDOOM_JOB_PDP, (job->ctx->page_directory_dma) >> 12);
 			uharddoom_iow(dev, UHARDDOOM_JOB_CMD_PTR, job->addr);
 			uharddoom_iow(dev, UHARDDOOM_JOB_CMD_SIZE, job->size);
@@ -147,10 +142,11 @@ static irqreturn_t uharddoom_isr(int irq, void *opaque)
 
 static int uharddoom_open(struct inode *inode, struct file *file)
 {
+	dma_addr_t dma_handle;
+	uint32_t* pd;
 	struct uharddoom_device *dev = container_of(inode->i_cdev, struct uharddoom_device, cdev);
 	struct uharddoom_context *ctx = kzalloc(sizeof *ctx, GFP_KERNEL);
-	if (!ctx)	
-		return -ENOMEM;
+	if (!ctx) goto err;
 	mutex_init(&ctx->mutex);
 	INIT_LIST_HEAD(&ctx->maps);
 	ctx->dev = dev;
@@ -158,22 +154,34 @@ static int uharddoom_open(struct inode *inode, struct file *file)
 	init_waitqueue_head(&ctx->wq);
 	ctx->pending_jobs = 0;
 	file->private_data = ctx;
-	/* alloc page directory full of zeros*/
-	dma_addr_t dma_handle;
-	//TODO sprawdzanie bledow do alloc x3
-	uint32_t* pd = dma_alloc_coherent(&dev->pdev->dev, 4096,&dma_handle, GFP_KERNEL | __GFP_ZERO);
+	/* alloc page directory full of zeros */
+	pd = dma_alloc_coherent(&dev->pdev->dev, PAGE_SIZE, &dma_handle, GFP_KERNEL | __GFP_ZERO);
+	if (!pd) goto err_pd;
 	ctx->page_directory = pd;
 	ctx->page_directory_dma = dma_handle;
 	ctx->page_tables = kzalloc(sizeof(*ctx->page_tables)*1024,GFP_KERNEL);
-        ctx->page_table_dma = kzalloc(sizeof(*ctx->page_table_dma)*1024, GFP_KERNEL);	
+	if (!ctx->page_tables) goto err_tables;
+    ctx->page_table_dma = kzalloc(sizeof(*ctx->page_table_dma)*1024, GFP_KERNEL);
+    if (!ctx->page_table_dma) goto err_table_dma;
 	return nonseekable_open(inode, file);
+err_table_dma:
+	kfree(ctx->page_tables);
+err_tables:
+	dma_free_coherent(&dev->pdev->dev, PAGE_SIZE, ctx->page_table_dma, dma_handle);
+err_pd:
+	kfree(ctx);
+err:	
+	return -ENOMEM;
 }
+
 long ioctl_unmap(struct uharddoom_context* ctx, uint32_t addr);
+
 static int uharddoom_release(struct inode *inode, struct file *file)
 {
 	struct uharddoom_context *ctx = file->private_data;
 	struct uharddoom_device *dev = ctx->dev;
 	unsigned long flags;
+	int i;
 	spin_lock_irqsave(&dev->slock, flags);
 	while (ctx->pending_jobs) {
 		spin_unlock_irqrestore(&dev->slock, flags);
@@ -184,7 +192,6 @@ static int uharddoom_release(struct inode *inode, struct file *file)
 	while(!list_empty(&ctx->maps)) {
 		ioctl_unmap(ctx, list_first_entry(&ctx->maps, struct uharddoom_map, lh)->virtual);
 	}
-	int i;	
 	for (i = 0; i < 1024; i++) {
 		if (ctx->page_tables[i]) {
 			dma_free_coherent(&ctx->dev->pdev->dev, PAGE_SIZE, ctx->page_tables[i], ctx->page_table_dma[i]);
@@ -193,18 +200,15 @@ static int uharddoom_release(struct inode *inode, struct file *file)
 	dma_free_coherent(&ctx->dev->pdev->dev, PAGE_SIZE, ctx->page_directory, ctx->page_directory_dma); 
 	kfree(ctx);
 	return 0;
-
 }
 
 
 static vm_fault_t buffer_fault(struct vm_fault *vmf)
 {
+	struct page* page;
 	struct uharddoom_buffer *buffer = vmf->vma->vm_private_data;
-       if (vmf->pgoff >= buffer->pages_nr)
-                return VM_FAULT_SIGBUS;
-
-	struct page *page;
 	int i = vmf->pgoff;
+    if (i >= buffer->pages_nr) return VM_FAULT_SIGBUS;
 	page = virt_to_page(buffer->pages[i].page);
 	get_page(page);
 	vmf->page = page;
@@ -216,7 +220,6 @@ static const struct vm_operations_struct buffer_vm = {
 };
 static int buffer_mmap(struct file *file, struct vm_area_struct *vma)
 {
-
 //	vma->vm_flags |= VM_IO | VM_DONTDUMP | VM_DONTEXPAND;
 	vma->vm_ops = &buffer_vm;
 	vma->vm_private_data = file->private_data;
@@ -226,7 +229,7 @@ static int buffer_mmap(struct file *file, struct vm_area_struct *vma)
 
 static int buffer_release(struct inode *inode, struct file *file)
 {
-        struct uharddoom_buffer *buf = file->private_data;
+    struct uharddoom_buffer *buf = file->private_data;
 	int i;
 	for (i = 0; i < buf->pages_nr; i++) {
 		dma_free_coherent(&buf->device->pdev->dev, PAGE_SIZE, buf->pages[i].page, buf->pages[i].addr);
@@ -235,30 +238,47 @@ static int buffer_release(struct inode *inode, struct file *file)
 	kfree(buf);
 	return 0;
 }
+
 const struct file_operations uharddoom_buf_ops = {
-        .owner = THIS_MODULE,
-        .release = buffer_release,
+    .owner = THIS_MODULE,
+    .release = buffer_release,
 	.mmap = buffer_mmap,
-
 };
-int ioctl_create(uint32_t size, struct uharddoom_device *dev) {
-	if (size == 0) return -EINVAL;
-	struct uharddoom_buffer *buffer;
-	buffer = kmalloc(sizeof(struct uharddoom_buffer), GFP_KERNEL);
-	buffer->pages_nr = (size % PAGE_SIZE == 0) ? (size / PAGE_SIZE) : (size / PAGE_SIZE) + 1;
-        buffer->pages = kmalloc(buffer->pages_nr * sizeof(struct uharddoom_page), GFP_KERNEL);
-	buffer->device = dev;
 
-	int i;
+int ioctl_create(uint32_t size, struct uharddoom_device *dev) {
+	int i, j;
+	struct uharddoom_buffer *buffer;
+	if (size == 0) return -EINVAL;
+	buffer = kmalloc(sizeof(struct uharddoom_buffer), GFP_KERNEL);
+	if (!buffer) goto err;
+	buffer->pages_nr = (size % PAGE_SIZE == 0) ? (size / PAGE_SIZE) : (size / PAGE_SIZE) + 1;
+    buffer->pages = kmalloc(buffer->pages_nr * sizeof(struct uharddoom_page), GFP_KERNEL);
+    if (!buffer->pages) {
+    	goto err_pages;
+    }
+	buffer->device = dev;
 	for (i = 0; i < buffer->pages_nr; i++) {
 		buffer->pages[i].page = dma_alloc_coherent(&dev->pdev->dev, PAGE_SIZE, &buffer->pages[i].addr, GFP_KERNEL | __GFP_ZERO);
+		if (!buffer->pages[i].page) {
+			goto err_dma;
+		}
 	}
 	return anon_inode_getfd("uharddoom buffer", &uharddoom_buf_ops, buffer, O_RDWR | O_CLOEXEC);
+err_dma:
+	for (j = 0; j < i; j++) {
+		dma_free_coherent(&dev->pdev->dev, PAGE_SIZE, &buffer->pages[i].page, buffer->pages[i].addr);
+	}
+	kfree(buffer->pages);
+err_pages:
+	kfree(buffer);
+err:
+	return -ENOMEM;
 }
 
-/* mapuje bufor do przestrzeni adresowej urządzenia powiązanej z obecnym kontekstem. Parametrami tego wywołania są deskryptor pliku odnoszący się do mapowanego bufora, oraz tryb mapowania (0 — do odczytu i zapisu, 1 — tylko do odczytu). Sterownik powinien sam znaleźć wolny adres wirtualny w obecnym kontekście. Wynikiem wywołania jest przydzielony adres wirtualny. W razie braku możliwości zmapowania bufora przez brak wolnej przestrzeni adresowej (bądź jej nadmierną fragmentację), należy zwrócić błąd ENOMEM. */
 
-long allocator(struct uharddoom_context* ctx,struct uharddoom_buffer *buf, 
+/* mapuje bufor do przestrzeni adresowej urządzenia powiązanej z obecnym kontekstem. Parametrami tego wywołania są deskryptor pliku odnoszący się do mapowanego bufora, oraz tryb mapowania (0 — do odczytu i zapisu, 1 — tylko do odczytu). Sterownik powinien sam znaleźć wolny adres wirtualny w obecnym kontekście. Wynikiem wywołania jest przydzielony adres wirtualny. W razie braku możliwości zmapowania bufora przez brak */
+
+long allocator(struct uharddoom_context* ctx, struct uharddoom_buffer *buf, 
 		struct file* file) {
 	struct uharddoom_map* i;
 	uint32_t prev = 0;
@@ -269,23 +289,24 @@ long allocator(struct uharddoom_context* ctx,struct uharddoom_buffer *buf,
 			// alokujemy
 			struct uharddoom_map* new;
 			new = kmalloc(sizeof(struct uharddoom_map), GFP_KERNEL);
+			if (!new) goto err;
 			new->context = ctx;
 			new->virtual = prev;
 			new->buffer = buf;
 			list_add_tail(&new->lh, &i->lh);
-			new->file = get_file(file);	
+			new->file = get_file(file);
 			alloced = true;
 			return prev;
 		}
 		prev = i->virtual + (i->buffer->pages_nr * PAGE_SIZE);
-		if (!prev) return -ENOMEM;
-	
+		if (!prev) goto err;
 	}
 	if ((1ull << 32) - prev < buf->pages_nr * PAGE_SIZE) {
-		return -ENOMEM;
+		goto err;
 	} else {
 		struct uharddoom_map* new;
 		new = kmalloc(sizeof(struct uharddoom_map), GFP_KERNEL);
+		if (!new) goto err;
 		new->context = ctx;
 		new->virtual = prev;
 		new->buffer = buf;
@@ -293,45 +314,52 @@ long allocator(struct uharddoom_context* ctx,struct uharddoom_buffer *buf,
 		list_add_tail(&new->lh, &ctx->maps);
 		return prev;
 	}
+err:
+	return -ENOMEM;
 }
 long ioctl_map(struct uharddoom_context* ctx, unsigned int fd, unsigned int rdonly) {
-
+	struct uharddoom_buffer* buffer;
+	long res;
+	int i, index_pd, index_pt;
+	uint32_t address;
 	struct fd file_desc = fdget(fd);
 	struct file* file = file_desc.file;
 	if (file->f_op != &uharddoom_buf_ops) {
 		fdput(file_desc);
 		return -EINVAL;
-	}	
-	struct uharddoom_buffer* buffer = file->private_data;
+	}
+	buffer = file->private_data;
 	if (buffer->device != ctx->dev) {
 		fdput(file_desc);
 		return -EXDEV;
 	}
-	long res = allocator(ctx, buffer, file);
+	res = allocator(ctx, buffer, file);
 	fdput(file_desc);
 	if (IS_ERR_VALUE (res)) {
 		return res;
+
 	}
-	int i;
 	for (i = 0; i < buffer->pages_nr; i++) {	
-		uint32_t address = res + i * PAGE_SIZE;
-		int index_pd = (address >> 22) & 0x3ff;
+		address = res + i * PAGE_SIZE;
+		index_pd = (address >> 22) & 0x3ff;
 		if (!ctx->page_tables[index_pd]) {
 			// sprawdzanie bledow 
 			ctx->page_tables[index_pd] = dma_alloc_coherent(&buffer->device->pdev->dev, sizeof(uint32_t)*1024, &ctx->page_table_dma[index_pd], GFP_KERNEL | __GFP_ZERO);
+			if (!ctx->page_tables[index_pd] ) return -ENOMEM;
 			ctx->page_directory[index_pd] = 1 | (ctx->page_table_dma[index_pd] >> 8); 
 		}
 
-
-		int index_pt = address >> 12 & 0x3ff;
+		index_pt = address >> 12 & 0x3ff;
 		ctx->page_tables[index_pd][index_pt] = 1 | (buffer->pages[i].addr >> 8) | (rdonly ? 0 : 2);
-	}	
+	}
 
 	return res;
 }
 
 long ioctl_unmap(struct uharddoom_context* ctx, uint32_t addr) {
 	bool found = false;
+	int i, index_pd, index_pt;
+	uint32_t address;
 	struct uharddoom_map* map;
 	list_for_each_entry(map, &ctx->maps, lh) {
 		if (map->virtual == addr) {
@@ -340,33 +368,27 @@ long ioctl_unmap(struct uharddoom_context* ctx, uint32_t addr) {
 		}
 	}
 	if (!found) return -ENOENT;
-	int i;
-	for (i = 0; i < map->buffer->pages_nr; i++) {	
-		
-		uint32_t address = map->virtual + i * PAGE_SIZE;
-		int index_pd = (address >> 22) & 0x3ff;
+	for (i = 0; i < map->buffer->pages_nr; i++) {
+		address = map->virtual + i * PAGE_SIZE;
+		index_pd = (address >> 22) & 0x3ff;
 		if (!map->context->page_tables[index_pd]) {
 			continue;
 		}
-
-		int index_pt = address >> 12 & 0x3ff;
+		index_pt = address >> 12 & 0x3ff;
 		ctx->page_tables[index_pd][index_pt] = 0;
-	}	
+	}
 	uharddoom_iow(ctx->dev, UHARDDOOM_RESET, UHARDDOOM_RESET_TLB_USER);
 	uharddoom_ior(ctx->dev, UHARDDOOM_STATUS);
-
 	fput(map->file);
 	list_del(&map->lh);
 	kfree(map);
 	return 0;
 }
 long ioctl_run(struct uharddoom_context* ctx, uint32_t addr, uint32_t size) {
-	if ( addr % 4 != 0 || size % 4 != 0) return -EINVAL;
-	
 	struct uharddoom_device *dev = ctx->dev;
-	long res = 0;
 	unsigned long flags;
 	struct uharddoom_job *ujob;
+	if ( addr % 4 != 0 || size % 4 != 0) return -EINVAL;
 	/* Get a job  */
 	spin_lock_irqsave(&dev->slock, flags);
 	while (list_empty(&dev->jobs_free)) {
@@ -392,11 +414,12 @@ long ioctl_run(struct uharddoom_context* ctx, uint32_t addr, uint32_t size) {
 	}
 	list_add_tail(&ujob->lh, &dev->jobs_running);
 	spin_unlock_irqrestore(&dev->slock, flags);
-	return 0;	
+	return 0;
 }
 long ioctl_wait(struct uharddoom_context* ctx, int32_t num_back) {
 
 	struct uharddoom_device *dev = ctx->dev;
+			
 	unsigned long flags;
 	spin_lock_irqsave(&dev->slock, flags);
 	while (ctx->pending_jobs > num_back) {
@@ -413,7 +436,7 @@ static long uharddoom_ioctl(struct file *filp, unsigned int cmd,
                             unsigned long arg)
 {
 	struct uharddoom_context *ctx = filp->private_data;
-        struct uharddoom_device *dev = ctx->dev;
+    struct uharddoom_device *dev = ctx->dev;
 
 	switch(cmd) {
 		case UDOOMDEV_IOCTL_CREATE_BUFFER: 
@@ -447,8 +470,10 @@ static long uharddoom_ioctl(struct file *filp, unsigned int cmd,
                 }
 
 		case UDOOMDEV_IOCTL_UNMAP_BUFFER:
+		
                 {
-                        struct udoomdev_ioctl_unmap_buffer ioctl_unmap_;
+                		struct udoomdev_ioctl_unmap_buffer ioctl_unmap_;
+
                         if (copy_from_user(
                           &ioctl_unmap_,
                           (const void __user *)arg,
@@ -526,7 +551,7 @@ static int uharddoom_probe(struct pci_dev *pdev,
 	INIT_LIST_HEAD(&dev->jobs_free);
 	INIT_LIST_HEAD(&dev->jobs_running);
 
-	/* Allocate a free index.  */
+	/* Allocate a free index. */
 	mutex_lock(&uharddoom_devices_lock);
 	for (i = 0; i < UHARDDOOM_MAX_DEVICES; i++)
 		if (!uharddoom_devices[i])
@@ -544,9 +569,9 @@ static int uharddoom_probe(struct pci_dev *pdev,
 	if ((err = pci_enable_device(pdev)))
 		goto out_enable;
 
-	if ((err = pci_set_dma_mask(pdev, DMA_BIT_MASK(32))))
+	if ((err = pci_set_dma_mask(pdev, DMA_BIT_MASK(40))))
 		goto out_mask;
-	if ((err = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(32))))
+	if ((err = pci_set_consistent_dma_mask(pdev, DMA_BIT_MASK(40))))
 		goto out_mask;
 	pci_set_master(pdev);
 
@@ -563,7 +588,6 @@ static int uharddoom_probe(struct pci_dev *pdev,
 	if ((err = request_irq(pdev->irq, uharddoom_isr, IRQF_SHARED, "uharddoom", dev)))
 		goto out_irq;
 
-	/* Allocate some buffers.  TODO    */
 	for (i = 0; i < UHARDDOOM_NUM_JOBS; i++) {
 		struct uharddoom_job *job = kmalloc(sizeof *job, GFP_KERNEL);
 		if (!job)
@@ -635,6 +659,7 @@ static void uharddoom_remove(struct pci_dev *pdev)
 	struct list_head *lh, *tmp;
 	struct uharddoom_device *dev = pci_get_drvdata(pdev);
 	if (dev->dev) {
+	/* Allocate some buffers.  TODO    */
 		device_destroy(&uharddoom_class, uharddoom_devno + dev->idx);
 	}
 	cdev_del(&dev->cdev);
